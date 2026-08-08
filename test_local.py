@@ -147,9 +147,15 @@ def run(scenario: str) -> None:
     divider("2. JOB SEARCH")
     live = []
     if os.getenv("ADZUNA_APP_ID", "").strip():
-        for term in (profile.get("search_terms") or [])[:2]:
-            live.extend(jobsearch.search(term, profile["neighborhood"]))
-        print(f"  Adzuna returned {len(live)} listings within {jobsearch.MAX_DAYS_OLD} days")
+        city = jobsearch.city_for(profile["neighborhood"])
+        print(f"  neighborhood {profile['neighborhood']!r} -> searching {city!r}")
+        seen = set()
+        for term in (profile.get("search_terms") or [])[:3]:
+            for job in jobsearch.search(term, city):
+                if job.url not in seen:
+                    seen.add(job.url)
+                    live.append(job)
+        print(f"  {len(live)} listings within {jobsearch.MAX_DAYS_OLD} days")
     pool = live or FIXTURES
     if not live:
         print(f"  No Adzuna credentials — using {len(FIXTURES)} clearly-marked SAMPLE listings")

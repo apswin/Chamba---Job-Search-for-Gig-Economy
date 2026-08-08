@@ -278,9 +278,9 @@ async def run_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await say(update, t(language, "thinking"))
     await typing(update, context)
 
-    where = profile.get("neighborhood") or "San Francisco"
-    if where in ("Somewhere else", "Otro lugar"):
-        where = "San Francisco"
+    # The neighborhood stays on the profile for ranking, but the API only
+    # understands cities — see jobs.city_for.
+    where = jobsearch.city_for(profile.get("neighborhood", ""))
     distance = DISTANCE_KM.get(profile.get("distance_key", "transit60"), 25)
     terms = profile.get("search_terms") or ["general labor"]
 

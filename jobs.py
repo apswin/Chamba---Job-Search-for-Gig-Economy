@@ -14,10 +14,12 @@ Two things matter here beyond "fetch some listings":
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
-from dataclasses import dataclass, asdict, field
+import time
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
@@ -27,9 +29,23 @@ import requests
 ADZUNA_BASE = "https://api.adzuna.com/v1/api/jobs/us/search/1"
 MAX_DAYS_OLD = 30
 RESULTS_PER_PAGE = 50
-REQUEST_TIMEOUT = 12
+REQUEST_TIMEOUT = 20
 
-CACHE_PATH = Path(__file__).parent / "data" / "cache_sf_jobs.json"
+# Adzuna's free tier throttles hard and without warning — it starts returning a
+# generic HTML error page rather than a JSON error, for every request, for an
+# extended period. Three defences, in order of importance:
+#   1. a per-query disk cache, so a repeated search costs nothing
+#   2. a minimum interval between calls, so we never burst
+#   3. bounded retries with backoff for transient 5xx
+MIN_SECONDS_BETWEEN_CALLS = 2.5
+MAX_RETRIES = 3
+CACHE_TTL_SECONDS = 60 * 60 * 6
+
+DATA_DIR = Path(__file__).parent / "data"
+CACHE_PATH = DATA_DIR / "cache_sf_jobs.json"
+QUERY_CACHE_DIR = DATA_DIR / "queries"
+
+_last_call_at = 0.0
 
 # Channels, in the order we prefer them: a text gets answered fastest, an email
 # is next, and a web form is the fallback we help the user survive.
@@ -173,22 +189,96 @@ def _parse_adzuna(raw: dict) -> Optional[Job]:
     )
 
 
+# Adzuna resolves `where` at city level, not neighborhood level. Sending
+# "Mission" returns jobs in Mission, Arizona; "Richmond" returns Richmond,
+# Virginia. Every SF neighborhood must be collapsed to its city before it goes
+# anywhere near the API. The neighborhood is still useful for ranking, so we
+# keep it on the profile — we just never send it as a location.
+BAY_AREA_CITIES = {
+    "san francisco", "oakland", "daly city", "berkeley", "san mateo",
+    "south san francisco", "richmond ca", "alameda", "san jose", "hayward",
+}
+
+
+def city_for(neighborhood: str) -> str:
+    """Collapse a neighborhood to a city Adzuna can actually resolve."""
+    if not neighborhood:
+        return "San Francisco"
+    clean = neighborhood.strip().lower()
+
+    # A user who typed an actual Bay Area city keeps it.
+    for city in BAY_AREA_CITIES:
+        if clean == city or clean.startswith(city):
+            return neighborhood.strip().title()
+
+    # Everything else — Mission, Bayview, SoMa, Tenderloin, Excelsior,
+    # Richmond, Sunset, Chinatown — is an SF neighborhood.
+    return "San Francisco"
+
+
+def _query_cache_path(what: str, where: str, distance_km: int) -> Path:
+    key = hashlib.sha1(f"{what}|{where}|{distance_km}".lower().encode()).hexdigest()[:16]
+    return QUERY_CACHE_DIR / f"{key}.json"
+
+
+def _read_query_cache(path: Path, allow_stale: bool = False) -> Optional[List[Job]]:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    age = time.time() - payload.get("saved_at", 0)
+    if age > CACHE_TTL_SECONDS and not allow_stale:
+        return None
+    return [Job(**raw) for raw in payload.get("jobs", [])]
+
+
+def _write_query_cache(path: Path, jobs: List[Job]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {"saved_at": time.time(), "jobs": [j.to_dict() for j in jobs]}, indent=2
+            )
+        )
+    except OSError:
+        pass
+
+
+def _throttle() -> None:
+    global _last_call_at
+    wait = MIN_SECONDS_BETWEEN_CALLS - (time.time() - _last_call_at)
+    if wait > 0:
+        time.sleep(wait)
+    _last_call_at = time.time()
+
+
 def search(
     what: str,
     where: str = "San Francisco",
     distance_km: int = 25,
     limit: int = RESULTS_PER_PAGE,
 ) -> List[Job]:
-    """Query Adzuna. Falls back to a cached snapshot on any failure.
+    """Query Adzuna, with a per-query cache in front of it.
 
-    The fallback is not a nicety — it is the difference between a demo that
-    survives hackathon wifi and one that does not.
+    Never raises. On any failure it degrades: fresh cache → stale cache →
+    last-good snapshot → empty. The demo must not die because a free-tier API
+    decided to throttle us.
     """
+    cache_path = _query_cache_path(what, where, distance_km)
+
+    cached = _read_query_cache(cache_path)
+    if cached is not None:
+        print(f"[jobs] cache hit for {what!r} ({len(cached)} listings)")
+        return cached
+
     app_id = os.getenv("ADZUNA_APP_ID", "").strip()
     app_key = os.getenv("ADZUNA_APP_KEY", "").strip()
-
     if not (app_id and app_key):
-        return load_cache(reason="no Adzuna credentials configured")
+        return _read_query_cache(cache_path, allow_stale=True) or load_cache(
+            reason="no Adzuna credentials configured"
+        )
 
     params = {
         "app_id": app_id,
@@ -202,18 +292,35 @@ def search(
         "content-type": "application/json",
     }
 
-    try:
-        response = requests.get(ADZUNA_BASE, params=params, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        payload = response.json()
-    except (requests.RequestException, ValueError) as exc:
-        return load_cache(reason=f"Adzuna request failed: {exc}")
+    payload = None
+    for attempt in range(MAX_RETRIES):
+        _throttle()
+        try:
+            response = requests.get(ADZUNA_BASE, params=params, timeout=REQUEST_TIMEOUT)
+            if response.status_code == 200:
+                payload = response.json()
+                break
+            # 4xx here is usually throttling dressed up as a bad request, so
+            # back off rather than failing fast.
+            print(f"[jobs] Adzuna HTTP {response.status_code} for {what!r}")
+        except (requests.RequestException, ValueError) as exc:
+            # Never interpolate the exception itself — requests embeds the full
+            # request URL, credentials and all.
+            print(f"[jobs] Adzuna {type(exc).__name__} for {what!r}")
+        if attempt < MAX_RETRIES - 1:
+            time.sleep(2 ** attempt * 2)
+
+    if payload is None:
+        stale = _read_query_cache(cache_path, allow_stale=True)
+        if stale:
+            print(f"[jobs] using stale cache for {what!r}")
+            return stale
+        return load_cache(reason="Adzuna unreachable and no query cache")
 
     jobs = [job for job in (_parse_adzuna(r) for r in payload.get("results", [])) if job]
-    if not jobs:
-        return load_cache(reason="Adzuna returned nothing usable")
-
-    save_cache(jobs)
+    if jobs:
+        _write_query_cache(cache_path, jobs)
+        save_cache(jobs)
     return jobs
 
 

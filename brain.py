@@ -22,7 +22,10 @@ from typing import List, Optional
 
 from anthropic import Anthropic
 
-MODEL = "claude-sonnet-5"  # Latency matters more than depth in a live chat.
+# Haiku is the default: this is short-form conversational work and cheap,
+# fast turns matter more than depth. Override with CHAMBA_MODEL if a specific
+# step ever needs more.
+MODEL = os.getenv("CHAMBA_MODEL", "claude-haiku-4-5-20251001")
 
 _client: Optional[Anthropic] = None
 
@@ -151,9 +154,17 @@ Here are live job listings near them. Each has an ID.
 
 {listings}
 
+This person lives in {neighborhood} and told us: {travel}.
+
 Pick the FIVE best matches for this specific person. Judge on:
 1. Can they actually do this job with the experience they have? (heaviest weight)
-2. Is it reachable given where they live and how far they can travel?
+2. Is it REACHABLE? This is a hard filter, not a preference. Most of these \
+workers do not own a car and are on buses and trains. A job in Walnut Creek, \
+Hillsborough, San Jose or anywhere over an hour away is a bad match no matter \
+what it pays — a high hourly rate they cannot physically get to is worth zero. \
+Prefer their own neighborhood, then the rest of their city, then a neighbouring \
+city on a direct transit line. Never rank a distant job above a closer one \
+solely because it pays more.
 3. Does the schedule fit their stated availability?
 4. How recently was it posted? Fresher is meaningfully better.
 5. Prefer listings they can respond to by text or email over web forms, \
@@ -175,6 +186,14 @@ Exactly five, best first. If fewer than five listings are genuinely plausible, \
 return only the plausible ones."""
 
 
+TRAVEL_TEXT = {
+    "walk": "they can only reach jobs within walking distance",
+    "transit30": "they can travel about 30 minutes by bus",
+    "transit60": "they can travel up to an hour",
+    "anywhere": "they can travel anywhere in the Bay Area",
+}
+
+
 def rank_jobs(profile: dict, jobs: list, language: str, top_n: int = 5) -> list:
     """Return the best `top_n` jobs, each with a `match_reason` filled in."""
     if not jobs:
@@ -189,7 +208,7 @@ def rank_jobs(profile: dict, jobs: list, language: str, top_n: int = 5) -> list:
 
     response = client().messages.create(
         model=MODEL,
-        max_tokens=1200,
+        max_tokens=1600,
         system=BASE_RULES,
         messages=[
             {
@@ -197,24 +216,47 @@ def rank_jobs(profile: dict, jobs: list, language: str, top_n: int = 5) -> list:
                 "content": MATCH_PROMPT.format(
                     profile=json.dumps(profile, indent=2, ensure_ascii=False),
                     listings=listings,
+                    neighborhood=profile.get("neighborhood") or "San Francisco",
+                    travel=TRAVEL_TEXT.get(
+                        profile.get("distance_key", "transit60"),
+                        "they can travel up to an hour",
+                    ),
                     language=LANGUAGE_NAME.get(language, "English"),
                 ),
             }
         ],
     )
 
+    matches = _json(response).get("matches", [])
+    if not matches:
+        # A truncated or malformed reply still usually contains well-formed
+        # id/reason pairs. Salvage them rather than throwing the ranking away.
+        matches = [
+            {"id": int(i), "reason": r}
+            for i, r in re.findall(
+                r'"id"\s*:\s*(\d+)\s*,\s*"reason"\s*:\s*"((?:[^"\\]|\\.)*)"',
+                _text(response),
+            )
+        ]
+        if matches:
+            print(f"[brain] ranking JSON malformed; salvaged {len(matches)} matches")
+
     ranked = []
-    for match in _json(response).get("matches", [])[:top_n]:
+    for match in matches[:top_n]:
         try:
             job = jobs[int(match["id"])]
         except (ValueError, KeyError, IndexError, TypeError):
             continue
-        job.match_reason = match.get("reason", "")
+        job.match_reason = (match.get("reason") or "").strip()
         ranked.append(job)
 
-    # If the model returned nothing usable, fall back to freshest-first rather
-    # than showing the user an empty screen.
-    return ranked or jobs[:top_n]
+    if not ranked:
+        # Never show an empty screen — but say loudly that these are unranked,
+        # because silently serving date-sorted results as "best matches" is a
+        # lie the user cannot detect.
+        print("[brain] RANKING FAILED — falling back to date order, no reasons")
+        return jobs[:top_n]
+    return ranked
 
 
 # --------------------------------------------------------------------------
