@@ -6,5 +6,7 @@
 __pycache__/
 *.pyc
 *.pdf
+*.log
+out/
 .DS_Store
 data/cache_*.json
