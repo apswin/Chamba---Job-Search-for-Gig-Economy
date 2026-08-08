@@ -563,7 +563,12 @@ def main() -> None:
             ],
         },
         fallbacks=[CommandHandler("reset", reset), CommandHandler("start", start)],
-        allow_reentry=True,
+        # allow_reentry MUST stay False. The entry points include a catch-all
+        # text handler so that any first message ("hi", "hola") starts the bot.
+        # With reentry enabled, that same handler also swallows every later
+        # message, restarting the greeting instead of advancing the state —
+        # the conversation can never get past question 1.
+        allow_reentry=False,
     )
 
     app.add_handler(conversation)
