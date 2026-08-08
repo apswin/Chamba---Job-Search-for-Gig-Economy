@@ -1,0 +1,10 @@
+.env
+.env.local
+*.key
+.venv/
+.claude/
+__pycache__/
+*.pyc
+*.pdf
+.DS_Store
+data/cache_*.json
