@@ -4,6 +4,8 @@
 
 👉 **Try it: [t.me/trygig_bot](https://t.me/trygig_bot)** — send it `hi` or `hola`. No account, no app, no resume needed.
 
+*The bot runs by long polling from a laptop, so it is live whenever `bot.py` is running. If it doesn't answer, it isn't deployed — see [Run it yourself](#run-it-yourself).*
+
 > *Chamba* is Mexican and Central American slang for a job or a gig — the word people actually use.
 
 Built at the **Claude Impact Lab**, San Francisco, 8 August 2026.
@@ -118,6 +120,7 @@ Telegram offers three APIs — we use the **Bot API**, not TDLib and not the MTP
 4. **Built the offline cache before the demo needed it.** Adzuna throttled us into generic HTML error pages after about fifteen rapid calls. We added a per-query disk cache, a minimum interval between calls, and bounded retries, then pulled a snapshot of **810 real listings across 20 queries** — 205 posted today, 323 within the week. The bot now answers from cache and never touches the network mid-demo.
 5. **Fixed two bugs the first end-to-end run exposed.** Passing the neighborhood `"Mission"` to the job API returned jobs in Mission, *Arizona* — the API resolves at city level, so neighborhoods are now collapsed before they go near it. And a silent fallback was serving date-sorted results as "best matches" whenever a parse failed, with nothing to indicate it. Silent degradation is worse than a crash; it now salvages what it can and says so loudly when it can't.
 6. **Tuned matching against a real failure.** The first good run ranked a $31/hr job in Walnut Creek above a San Francisco one, for a worker in the Mission with no car. Reachability is now a hard filter, not a preference — a wage you cannot physically get to is worth zero.
+7. **Tested it as a user, and it broke.** The first real run through Telegram never got past question 1 — every answer bounced back to the greeting. Two bugs were stacked: `allow_reentry=True` on the conversation handler meant our catch-all "any message starts the bot" entry point also swallowed every *later* message, and separately three bot processes were polling the same token at once, stealing each other's updates. Scripted terminal tests had caught neither. Both are fixed; [TESTING.md](TESTING.md) now scripts four conversations, including the two designed to break it.
 
 ---
 
@@ -152,6 +155,16 @@ Telegram Bot API  (long polling — no server, no webhook, no tunnel)
 ```
 
 Language is one line in the system prompt, not a translation layer.
+
+**Everything else in the repo**
+
+| File | |
+|---|---|
+| [SCOPE.md](SCOPE.md) | ICP, anti-ICP, eight user stories with acceptance criteria, success metrics |
+| [TESTING.md](TESTING.md) | Four scripted test conversations, including two written to break it |
+| [build_snapshot.py](build_snapshot.py) | Caches real Bay Area listings so a demo never depends on the network |
+| [test_local.py](test_local.py) | Whole pipeline in the terminal, no Telegram needed |
+| `data/queries/` | The cached snapshot — 810 real listings, committed so this repo runs without an Adzuna key |
 
 ---
 
